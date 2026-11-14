@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+.claude-magpie-zh-cache/
+*.log
+*.tmp
+dist/
+build/
