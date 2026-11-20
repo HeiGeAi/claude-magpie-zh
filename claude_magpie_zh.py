@@ -729,6 +729,14 @@ def stage_localized_app(
     if not src_app.exists():
         raise FileNotFoundError(f"Source app not found: {src_app}")
 
+    source = src_app.resolve()
+    destination = dst_app.resolve()
+    if (
+        destination.is_relative_to(source) or source.is_relative_to(destination)
+        or (dst_app.exists() and src_app.samefile(dst_app))
+    ):
+        raise ValueError(f"Source and staging apps must not overlap: {src_app} -> {dst_app}")
+
     t0 = time.perf_counter()
     if dst_app.exists():
         shutil.rmtree(dst_app)
@@ -806,15 +814,37 @@ def update_profile_locales(lang: str, *, home: Path | None = None) -> list[Path]
     for d in discover_profile_dirs(home):
         cfg = d / "config.json"
         data: dict[str, Any] = {}
-        if cfg.exists():
-            try:
-                loaded = json.loads(cfg.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    data = loaded
-            except (OSError, json.JSONDecodeError):
-                pass
+        mode = None
+        try:
+            target = cfg.resolve()
+            if target.exists():
+                loaded = json.loads(target.read_text(encoding="utf-8-sig"))
+                if not isinstance(loaded, dict):
+                    raise ValueError("expected a JSON object")
+                data = loaded
+                mode = target.stat().st_mode & 0o777
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"WARNING: Preserving {cfg}; unable to read its settings: {exc}", file=sys.stderr)
+            continue
+
         data["locale"] = lang
-        cfg.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=target.parent, delete=False
+            ) as handle:
+                tmp = Path(handle.name)
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            if mode is not None:
+                tmp.chmod(mode)
+            tmp.replace(target)
+        except OSError as exc:
+            print(f"WARNING: Unable to update locale in {cfg}: {exc}", file=sys.stderr)
+            continue
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
         updated.append(cfg)
     return updated
 
@@ -962,12 +992,17 @@ mod.swap_staged_into_place(
 
 
 def find_latest_backup(backup_dir: Path) -> Path | None:
-    candidates = sorted(
-        backup_dir.glob("Claude.backup-before-*.app"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    return candidates[0] if candidates else None
+    def backup_time(path: Path) -> float:
+        stamp = re.search(r"-(\d{8}-\d{6})\.app$", path.name)
+        if stamp:
+            try:
+                return time.mktime(time.strptime(stamp.group(1), "%Y%m%d-%H%M%S"))
+            except ValueError:
+                pass  # Older or manually named backups can still use mtime.
+        return path.stat().st_mtime
+
+    candidates = (p for p in backup_dir.glob("Claude.backup-before-*.app") if p.is_dir())
+    return max(candidates, key=backup_time, default=None)
 
 
 def restore_backup(
@@ -1149,7 +1184,8 @@ def main(argv: list[str] | None = None) -> int:
             lang=args.lang,
             relaunch_mode=args.relaunch,
         )
-        shutil.rmtree(stage_root, ignore_errors=True)
+        if args.stage_dir is None:
+            shutil.rmtree(stage_root, ignore_errors=True)
         log(f"Localization complete! Backup saved at: {backup_path}")
         return 0
 

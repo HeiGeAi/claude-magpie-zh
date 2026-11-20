@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import plistlib
 from pathlib import Path
 import struct
@@ -190,6 +191,46 @@ class IntegrityAndConfigTests(unittest.TestCase):
             self.assertEqual(json.loads((p1 / "config.json").read_text())["locale"], "zh-CN")
             self.assertEqual(json.loads((p1 / "config.json").read_text())["theme"], "light")
             self.assertEqual(json.loads((p2 / "config.json").read_text())["locale"], "zh-CN")
+
+    def test_update_profile_locales_preserves_bom_and_skips_invalid_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            support = home / "Library/Application Support"
+            config = support / "Claude" / "config.json"
+            invalid = support / "Claude-Magpie-3p" / "config.json"
+            config.parent.mkdir(parents=True)
+            invalid.parent.mkdir()
+            config.write_text('{"theme":"dark","locale":"de-DE"}', encoding="utf-8-sig")
+            invalid.write_bytes(b'{"theme":"light",}')
+
+            self.assertEqual(cmz.update_profile_locales("zh-CN", home=home), [config])
+            self.assertEqual(json.loads(config.read_text()), {"theme": "dark", "locale": "zh-CN"})
+            self.assertEqual(invalid.read_bytes(), b'{"theme":"light",}')
+
+    def test_stage_refuses_source_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "Claude.app"
+            source.mkdir()
+            marker = source / "preserve"
+            marker.write_text("original")
+            alias = root / "Alias.app"
+            alias.symlink_to(source, target_is_directory=True)
+            for destination in [source, alias, root, source / "nested" / "Claude.app"]:
+                with self.subTest(destination=destination), self.assertRaisesRegex(ValueError, "overlap"):
+                    cmz.stage_localized_app(src_app=source, dst_app=destination, resources=root, lang="zh-CN")
+                self.assertEqual(marker.read_text(), "original")
+
+    def test_latest_backup_uses_name_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            older = root / "Claude.backup-before-zh-CN-20261117-091011.app"
+            newer = root / "Claude.backup-before-zh-TW-20261120-091011.app"
+            older.mkdir()
+            newer.mkdir()
+            os.utime(older, (1800000000, 1800000000))
+            os.utime(newer, (1700000000, 1700000000))
+            self.assertEqual(cmz.find_latest_backup(root), newer)
 
     def test_status_cli_on_synthetic_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
