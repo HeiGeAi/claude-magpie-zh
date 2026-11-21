@@ -4,8 +4,11 @@ import os
 import plistlib
 from pathlib import Path
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import claude_magpie_zh as cmz
 
@@ -64,6 +67,24 @@ class AsarRoundTripTests(unittest.TestCase):
             asar_path.write_bytes(_make_raw_asar({"../escape.txt": b"boom"}))
             with self.assertRaises(RuntimeError):
                 cmz.extract_asar(asar_path, root / "dst")
+
+    def test_rejects_short_header_and_out_of_bounds_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            short_hdr = root / "short.asar"
+            short_hdr.write_bytes(struct.pack("<II", 4, 4) + b"\x00" * 16)
+            with self.assertRaises(RuntimeError):
+                cmz.read_asar_header(short_hdr.read_bytes(), short_hdr)
+
+            truncated = root / "truncated.asar"
+            raw = _make_raw_asar({"a.txt": b"hello world"})
+            truncated.write_bytes(raw[:-3])
+            data = truncated.read_bytes()
+            hs, _, hdr = cmz.read_asar_header(data, truncated)
+            with self.assertRaises(RuntimeError):
+                cmz.read_asar_entry(data, hs, hdr, "a.txt")
+            with self.assertRaises(RuntimeError):
+                cmz.extract_asar(truncated, root / "out")
 
 
 class PatchLogicTests(unittest.TestCase):
@@ -247,6 +268,149 @@ class IntegrityAndConfigTests(unittest.TestCase):
             self.assertEqual(status["version"], "5.1.0")
             self.assertEqual(status["profiles"], {})
             self.assertFalse(status["has_ion_dist_asar"])
+
+    def test_apply_slash_menu_patch_updates_unpacked_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = root / "Claude.app"
+            res_dir = app / "Contents/Resources"
+            res_dir.mkdir(parents=True)
+
+            app_src = root / "app-src"
+            (app_src / "native").mkdir(parents=True)
+            (app_src / "main.js").write_text('const label = "Slash menu";', encoding="utf-8")
+            (app_src / "native/ext.js").write_text('const ext = "Slash menu";', encoding="utf-8")
+            app_asar = res_dir / "app.asar"
+            cmz.build_asar(app_src, app_asar, {"native/ext.js"})
+
+            plist_data = {
+                "CFBundleShortVersionString": "5.1.0",
+                "CFBundleIdentifier": "com.example.claude",
+                "ElectronAsarIntegrity": {
+                    "Resources/app.asar": {"algorithm": "SHA256", "hash": "0" * 64},
+                },
+            }
+            with (app / "Contents/Info.plist").open("wb") as f:
+                plistlib.dump(plist_data, f, fmt=plistlib.FMT_BINARY)
+
+            dict_dir = root / "dicts"
+            dict_dir.mkdir()
+            (dict_dir / "slash-command-menu-patch.json").write_text(
+                json.dumps({"zh-CN": {"Slash menu": "斜杠菜单"}}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            applied = cmz.apply_slash_menu_patch(app, dict_dir, "zh-CN")
+            self.assertTrue(applied)
+            self.assertFalse((res_dir / "app.asar.new.unpacked").exists())
+            self.assertFalse((res_dir / "app.asar.new").exists())
+            self.assertEqual(
+                (res_dir / "app.asar.unpacked/native/ext.js").read_text(encoding="utf-8"),
+                'const ext = "斜杠菜单";',
+            )
+            raw = app_asar.read_bytes()
+            hs, h_str, hdr = cmz.read_asar_header(raw, app_asar)
+            self.assertEqual(
+                cmz.read_asar_entry(raw, hs, hdr, "main.js"),
+                'const label = "斜杠菜单";'.encode("utf-8"),
+            )
+            with (app / "Contents/Info.plist").open("rb") as f:
+                updated_plist = plistlib.load(f)
+            self.assertEqual(
+                updated_plist["ElectronAsarIntegrity"]["Resources/app.asar"]["hash"],
+                hashlib.sha256(h_str.encode("utf-8")).hexdigest(),
+            )
+
+    def test_inspect_status_reads_utf8_bom_config_and_cli_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = root / "Claude.app"
+            (app / "Contents/Resources").mkdir(parents=True)
+            with (app / "Contents/Info.plist").open("wb") as f:
+                plistlib.dump({"CFBundleShortVersionString": "5.2.0"}, f, fmt=plistlib.FMT_BINARY)
+            cfg_dir = root / "Library/Application Support/Claude"
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "config.json").write_text('{"locale":"zh-CN"}', encoding="utf-8-sig")
+
+            status = cmz.inspect_status(app, root, "zh-CN", home=root)
+            self.assertEqual(status["profiles"]["Claude"], "zh-CN")
+
+            script = Path(__file__).resolve().parent.parent / "claude_magpie_zh.py"
+            proc = subprocess.run(
+                [sys.executable, str(script), "status", "--app", str(app), "--backup-dir", str(root), "--json"],
+                env={**os.environ, "HOME": str(root)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            parsed = json.loads(proc.stdout)
+            self.assertEqual(parsed["profiles"]["Claude"], "zh-CN")
+            self.assertEqual(parsed["version"], "5.2.0")
+
+    def test_swap_creates_backup_dir_and_avoids_timestamp_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "Claude.app"
+            (target / "Contents/MacOS").mkdir(parents=True)
+            (target / "Contents/MacOS/Claude").write_text("orig", encoding="utf-8")
+
+            staged = root / "staged/Claude.app"
+            (staged / "Contents/MacOS").mkdir(parents=True)
+            (staged / "Contents/MacOS/Claude").write_text("new", encoding="utf-8")
+
+            backup_dir = root / "nested/backups"
+            fixed_stamp = "20261121-120000"
+            with (
+                patch.object(cmz, "quit_claude_processes"),
+                patch.object(cmz, "update_profile_locales", return_value=[]),
+                patch.object(cmz.time, "strftime", return_value=fixed_stamp),
+            ):
+                b1 = cmz.swap_staged_into_place(
+                    staged_app=staged,
+                    target_app=target,
+                    backup_dir=backup_dir,
+                    lang="zh-CN",
+                    relaunch_mode="none",
+                )
+                self.assertEqual(b1.name, f"Claude.backup-before-zh-CN-{fixed_stamp}.app")
+                self.assertEqual((b1 / "Contents/MacOS/Claude").read_text(encoding="utf-8"), "orig")
+
+                staged2 = root / "staged2/Claude.app"
+                (staged2 / "Contents/MacOS").mkdir(parents=True)
+                (staged2 / "Contents/MacOS/Claude").write_text("newer", encoding="utf-8")
+                b2 = cmz.swap_staged_into_place(
+                    staged_app=staged2,
+                    target_app=target,
+                    backup_dir=backup_dir,
+                    lang="zh-CN",
+                    relaunch_mode="none",
+                )
+                self.assertEqual(b2.name, f"Claude.backup-before-zh-CN-{fixed_stamp}-1.app")
+                self.assertFalse((b1 / "Claude.app").exists())
+                self.assertEqual(cmz.find_latest_backup(backup_dir), b2)
+
+    def test_restore_refuses_overlapping_backup_and_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "Claude.app"
+            target.mkdir()
+            marker = target / "marker"
+            marker.write_text("keep", encoding="utf-8")
+            alias = root / "Alias.app"
+            alias.symlink_to(target, target_is_directory=True)
+            nested = target / "nested.app"
+            nested.mkdir()
+
+            for bad_backup in (target, alias, root, nested):
+                with self.subTest(bad_backup=bad_backup), self.assertRaisesRegex(ValueError, "overlap"):
+                    cmz.restore_backup(
+                        target_app=target,
+                        backup_dir=root,
+                        backup_path=bad_backup,
+                        relaunch_mode="none",
+                    )
+                self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
 
 
 if __name__ == "__main__":

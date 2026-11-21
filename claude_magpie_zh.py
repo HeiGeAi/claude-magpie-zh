@@ -117,14 +117,17 @@ def read_asar_header(data: bytes, path: Path) -> tuple[int, str, dict[str, Any]]
     if len(data) < 16:
         raise RuntimeError(f"Invalid ASAR archive (too small): {path}")
     size_payload, header_size = struct.unpack_from("<II", data, 0)
-    if size_payload != 4 or header_size <= 0 or len(data) < 8 + header_size:
+    if size_payload != 4 or header_size < 8 or len(data) < 8 + header_size:
         raise RuntimeError(f"Unsupported ASAR header in {path}")
     pickle = data[8 : 8 + header_size]
     payload_size, str_size = struct.unpack_from("<Ii", pickle, 0)
     if str_size < 0 or payload_size != align4(4 + str_size) or header_size != 4 + payload_size:
         raise RuntimeError(f"Unsupported ASAR pickle layout in {path}")
     header_str = pickle[8 : 8 + str_size].decode("utf-8")
-    return header_size, header_str, json.loads(header_str)
+    parsed = json.loads(header_str)
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"Invalid ASAR header JSON in {path}")
+    return header_size, header_str, parsed
 
 
 def walk_asar(header: dict[str, Any]):
@@ -161,6 +164,8 @@ def read_asar_entry(
     offset = int(node["offset"])
     size = int(node["size"])
     start = 8 + header_size + offset
+    if offset < 0 or size < 0 or start + size > len(data):
+        raise RuntimeError(f"ASAR entry out of bounds: {rel}")
     return data[start : start + size]
 
 
@@ -187,11 +192,19 @@ def extract_asar(asar_path: Path, dst: Path) -> set[str]:
             src_unpacked = unpacked_root / Path(*parts)
             if not src_unpacked.exists():
                 raise RuntimeError(f"Missing unpacked ASAR file: {src_unpacked}")
+            if src_unpacked.is_symlink():
+                raise RuntimeError(f"Symlink unpacked ASAR file is unsupported: {rel}")
+            resolved_unpacked = src_unpacked.resolve()
+            resolved_unpacked_root = unpacked_root.resolve()
+            if resolved_unpacked != resolved_unpacked_root and resolved_unpacked_root not in resolved_unpacked.parents:
+                raise RuntimeError(f"Escaping unpacked ASAR path rejected: {rel}")
             shutil.copy2(src_unpacked, target)
             unpacked.add(rel)
         else:
             off = int(entry["offset"])
             sz = int(entry["size"])
+            if off < 0 or sz < 0 or data_start + off + sz > len(data):
+                raise RuntimeError(f"ASAR entry out of bounds: {rel}")
             target.write_bytes(data[data_start + off : data_start + off + sz])
     return unpacked
 
@@ -262,6 +275,39 @@ def build_asar(src_dir: Path, dst: Path, unpacked: set[str]) -> None:
             tgt = u_root / Path(*rel.split("/"))
             tgt.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src_dir / Path(*rel.split("/")), tgt)
+
+
+def replace_asar_bundle(src_dir: Path, dst_asar: Path, unpacked: set[str]) -> None:
+    tmp_asar = dst_asar.with_name(dst_asar.name + ".new")
+    tmp_unpacked = Path(str(tmp_asar) + ".unpacked")
+    dst_unpacked = Path(str(dst_asar) + ".unpacked")
+    old_unpacked = dst_asar.with_name(dst_asar.name + ".unpacked.old")
+    if tmp_unpacked.exists():
+        shutil.rmtree(tmp_unpacked)
+    if old_unpacked.exists():
+        shutil.rmtree(old_unpacked)
+    try:
+        build_asar(src_dir, tmp_asar, unpacked)
+        if unpacked and tmp_unpacked.exists():
+            if dst_unpacked.exists():
+                os.replace(dst_unpacked, old_unpacked)
+            try:
+                os.replace(tmp_unpacked, dst_unpacked)
+                os.replace(tmp_asar, dst_asar)
+            except Exception:
+                if dst_unpacked.exists() and old_unpacked.exists():
+                    shutil.rmtree(dst_unpacked, ignore_errors=True)
+                if not dst_unpacked.exists() and old_unpacked.exists():
+                    os.replace(old_unpacked, dst_unpacked)
+                raise
+            if old_unpacked.exists():
+                shutil.rmtree(old_unpacked, ignore_errors=True)
+        else:
+            os.replace(tmp_asar, dst_asar)
+    finally:
+        tmp_asar.unlink(missing_ok=True)
+        if tmp_unpacked.exists():
+            shutil.rmtree(tmp_unpacked, ignore_errors=True)
 
 
 def find_assets_dir(ion_dist: Path) -> Path:
@@ -705,14 +751,22 @@ def apply_slash_menu_patch(app: Path, resources: Path, lang: str) -> bool:
                 js.write_text(cur, encoding="utf-8")
         if replacements == 0:
             return False
-        tmp_asar = app_asar.with_name("app.asar.new")
-        build_asar(tmp_dir, tmp_asar, unpacked)
-        os.replace(tmp_asar, app_asar)
+        replace_asar_bundle(tmp_dir, app_asar, unpacked)
         update_asar_integrity(app, "Resources/app.asar", app_asar)
         log(f"  applied slash-command menu patch ({replacements} rule hits)")
         return True
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _ensure_paths_do_not_overlap(src: Path, dst: Path, description: str) -> None:
+    source = src.resolve()
+    destination = dst.resolve()
+    if (
+        destination.is_relative_to(source) or source.is_relative_to(destination)
+        or (src.exists() and dst.exists() and src.samefile(dst))
+    ):
+        raise ValueError(f"{description} must not overlap: {src} -> {dst}")
 
 
 def stage_localized_app(
@@ -729,13 +783,7 @@ def stage_localized_app(
     if not src_app.exists():
         raise FileNotFoundError(f"Source app not found: {src_app}")
 
-    source = src_app.resolve()
-    destination = dst_app.resolve()
-    if (
-        destination.is_relative_to(source) or source.is_relative_to(destination)
-        or (dst_app.exists() and src_app.samefile(dst_app))
-    ):
-        raise ValueError(f"Source and staging apps must not overlap: {src_app} -> {dst_app}")
+    _ensure_paths_do_not_overlap(src_app, dst_app, "Source and staging apps")
 
     t0 = time.perf_counter()
     if dst_app.exists():
@@ -778,9 +826,7 @@ def stage_localized_app(
                 shutil.copy2(loc_str, d / "Localizable.strings")
 
         log("4. Rebuilding ion-dist.asar")
-        tmp_asar = ion_asar.with_name("ion-dist.asar.new")
-        build_asar(ion_dir, tmp_asar, unpacked)
-        os.replace(tmp_asar, ion_asar)
+        replace_asar_bundle(ion_dir, ion_asar, unpacked)
     finally:
         shutil.rmtree(ion_dir, ignore_errors=True)
 
@@ -896,18 +942,28 @@ def resolve_resources_dir(
 
 def quit_claude_processes(app_path: Path) -> None:
     run_cmd(["osascript", "-e", 'tell application "Claude" to quit'], check=False)
-    pattern = f"{app_path}/Contents/"
+    pattern = re.escape(f"{app_path}/Contents/")
     for i in range(1, 21):
-        chk = subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        chk = subprocess.run(["pgrep", "-f", "--", pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if chk.returncode != 0:
             break
         if i == 10:
             log("Sending SIGTERM to remaining Claude processes...")
-            subprocess.run(["pkill", "-TERM", "-f", pattern], check=False)
+            subprocess.run(["pkill", "-TERM", "-f", "--", pattern], check=False)
         elif i == 16:
             log("Sending SIGKILL to stubborn Claude processes...")
-            subprocess.run(["pkill", "-KILL", "-f", pattern], check=False)
+            subprocess.run(["pkill", "-KILL", "-f", "--", pattern], check=False)
         time.sleep(0.5)
+
+
+def _unique_backup_path(backup_dir: Path, lang: str, stamp: str) -> Path:
+    base = f"Claude.backup-before-{lang}-{stamp}"
+    candidate = backup_dir / f"{base}.app"
+    idx = 1
+    while candidate.exists():
+        candidate = backup_dir / f"{base}-{idx}.app"
+        idx += 1
+    return candidate
 
 
 def swap_staged_into_place(
@@ -920,8 +976,10 @@ def swap_staged_into_place(
 ) -> Path:
     if not (staged_app / "Contents/MacOS/Claude").exists():
         raise RuntimeError(f"Staged app binary missing: {staged_app}")
+    _ensure_paths_do_not_overlap(staged_app, target_app, "Staged and target apps")
+    backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup_path = backup_dir / f"Claude.backup-before-{lang}-{stamp}.app"
+    backup_path = _unique_backup_path(backup_dir, lang, stamp)
 
     quit_claude_processes(target_app)
 
@@ -992,14 +1050,15 @@ mod.swap_staged_into_place(
 
 
 def find_latest_backup(backup_dir: Path) -> Path | None:
-    def backup_time(path: Path) -> float:
-        stamp = re.search(r"-(\d{8}-\d{6})\.app$", path.name)
+    def backup_time(path: Path) -> tuple[float, int]:
+        stamp = re.search(r"-(\d{8}-\d{6})(?:-(\d+))?\.app$", path.name)
         if stamp:
             try:
-                return time.mktime(time.strptime(stamp.group(1), "%Y%m%d-%H%M%S"))
+                ts = time.mktime(time.strptime(stamp.group(1), "%Y%m%d-%H%M%S"))
+                return (ts, int(stamp.group(2) or 0))
             except ValueError:
                 pass  # Older or manually named backups can still use mtime.
-        return path.stat().st_mtime
+        return (path.stat().st_mtime, -1)
 
     candidates = (p for p in backup_dir.glob("Claude.backup-before-*.app") if p.is_dir())
     return max(candidates, key=backup_time, default=None)
@@ -1017,10 +1076,16 @@ def restore_backup(
         raise FileNotFoundError(
             f"No backup found matching {backup_dir}/Claude.backup-before-*.app"
         )
+    _ensure_paths_do_not_overlap(chosen, target_app, "Backup and target apps")
 
     quit_claude_processes(target_app)
 
-    removing = target_app.with_name(f"Claude.zh-removing-{time.strftime('%Y%m%d-%H%M%S')}.app")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    removing = target_app.with_name(f"Claude.zh-removing-{stamp}.app")
+    idx = 1
+    while removing.exists():
+        removing = target_app.with_name(f"Claude.zh-removing-{stamp}-{idx}.app")
+        idx += 1
     if target_app.exists():
         shutil.move(str(target_app), str(removing))
     try:
@@ -1061,7 +1126,10 @@ def inspect_status(
         locale_val = None
         if cfg.exists():
             try:
-                locale_val = json.loads(cfg.read_text(encoding="utf-8")).get("locale")
+                loaded = json.loads(cfg.read_text(encoding="utf-8-sig"))
+                if not isinstance(loaded, dict):
+                    raise ValueError("expected a JSON object")
+                locale_val = loaded.get("locale")
             except Exception:
                 locale_val = "<unreadable>"
         info["profiles"][d.name] = locale_val
